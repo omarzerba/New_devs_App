@@ -2,6 +2,39 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, List
 
+# When the DB pool is unavailable, revenue falls back to this map. It MUST be keyed by
+# tenant_id first, then property_id — otherwise Sunset and Ocean would see identical
+# figures for the same property id (confusing when testing tenant isolation).
+# IDs align with database/seed.sql and backend/app/api/v1/login.py (tenant-a / tenant-b).
+_DEV_MOCK_REVENUE: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "tenant-a": {
+        "prop-001": {"total": "2250.01", "count": 4},
+        "prop-002": {"total": "4975.50", "count": 4},
+        "prop-003": {"total": "6100.50", "count": 2},
+        "prop-004": {"total": "0.00", "count": 0},
+        "prop-005": {"total": "0.00", "count": 0},
+    },
+    "tenant-b": {
+        "prop-001": {"total": "9420.77", "count": 5},
+        "prop-002": {"total": "0.00", "count": 0},
+        "prop-003": {"total": "0.00", "count": 0},
+        "prop-004": {"total": "1776.50", "count": 4},
+        "prop-005": {"total": "3256.00", "count": 3},
+    },
+}
+
+
+def _mock_revenue_row(tenant_id: str, property_id: str) -> Dict[str, Any]:
+    by_tenant = _DEV_MOCK_REVENUE.get(tenant_id) or _DEV_MOCK_REVENUE.get("tenant-a", {})
+    row = by_tenant.get(property_id, {"total": "0.00", "count": 0})
+    return {
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+        "total": row["total"],
+        "currency": "USD",
+        "count": row["count"],
+    }
+
 async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
     """
     Calculates revenue for a specific month.
@@ -87,23 +120,5 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
             
     except Exception as e:
         print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        
-        # Create property-specific mock data for testing when DB is unavailable
-        # This ensures each property shows different figures
-        mock_data = {
-            'prop-001': {'total': '1000.00', 'count': 3},
-            'prop-002': {'total': '4975.50', 'count': 4}, 
-            'prop-003': {'total': '6100.50', 'count': 2},
-            'prop-004': {'total': '1776.50', 'count': 4},
-            'prop-005': {'total': '3256.00', 'count': 3}
-        }
-        
-        mock_property_data = mock_data.get(property_id, {'total': '0.00', 'count': 0})
-        
-        return {
-            "property_id": property_id,
-            "tenant_id": tenant_id, 
-            "total": mock_property_data['total'],
-            "currency": "USD",
-            "count": mock_property_data['count']
-        }
+
+        return _mock_revenue_row(tenant_id, property_id)
