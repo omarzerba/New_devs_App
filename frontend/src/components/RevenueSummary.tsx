@@ -7,6 +7,10 @@ interface RevenueData {
     total_revenue: string;
     currency: string;
     reservations_count: number;
+    period_year?: number;
+    period_month?: number;
+    revenue_basis?: string;
+    property_timezone?: string;
 }
 
 /** Normalize API value to a XX[.yy] string without multiplying floats. */
@@ -47,13 +51,27 @@ function formatMoneyString(amountStr: string, currency: string): string {
     return `${currency} ${neg ? '-' : ''}${grouped}.${frac || '00'}`;
 }
 
+const MONTH_LABELS = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+];
+
 interface RevenueSummaryProps {
     propertyId?: string;
-    debugTenant?: string; 
+    /** Calendar month (1–12). When set with year, API returns that month only (property timezone). */
+    year?: number;
+    month?: number;
+    debugTenant?: string;
     showRaw?: boolean;
 }
 
-export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'prop-001', debugTenant, showRaw }) => {
+export const RevenueSummary: React.FC<RevenueSummaryProps> = ({
+    propertyId = 'prop-001',
+    year,
+    month,
+    debugTenant,
+    showRaw
+}) => {
     const [data, setData] = useState<RevenueData | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -68,7 +86,8 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
                 // We pass the simulatedTenant option which SecureAPI will attach as a header
                 const response = await SecureAPI.getDashboardSummary(propertyId, {
                     simulatedTenant: activeTenant,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    ...(year != null && month != null ? { year, month } : {}),
                 });
                 setData({
                     ...response,
@@ -83,7 +102,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
         };
 
         fetchRevenue();
-    }, [propertyId, activeTenant]);
+    }, [propertyId, activeTenant, year, month]);
 
     if (loading) {
         return (
@@ -104,6 +123,14 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
     if (!data) return null;
 
     const displayLabel = formatMoneyString(data.total_revenue, data.currency);
+    const periodSubtitle =
+        data.period_year != null && data.period_month != null
+            ? `${MONTH_LABELS[data.period_month - 1]} ${data.period_year}${
+                  data.property_timezone ? ` · ${data.property_timezone}` : ''
+              } (check-in in property local month)`
+            : data.revenue_basis === 'lifetime_all_check_ins'
+              ? 'All time (all check-ins)'
+              : null;
     // Optional leading minus, at least one digit, exactly one dot, exactly two fractional digits (canonical API shape).
     // ^-?         optional minus at start.
     // \d+         one or more digits before the decimal.
@@ -125,6 +152,9 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
                 <div className="flex items-center justify-between mb-6">
                     <div>
                         <h2 className="text-sm font-medium text-gray-500 uppercase tracking-wide">Total Revenue</h2>
+                        {periodSubtitle && (
+                            <p className="text-xs text-gray-500 mt-0.5">{periodSubtitle}</p>
+                        )}
                         <div className="flex items-baseline gap-2 mt-1">
                             <span className="text-3xl font-bold text-gray-900 tracking-tight">
                                 {displayLabel}

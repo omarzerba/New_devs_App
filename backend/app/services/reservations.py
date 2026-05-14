@@ -1,6 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Any, List
+from typing import Dict, Any, Tuple
+
+from zoneinfo import ZoneInfo
 
 # When the DB pool is unavailable, revenue falls back to this map. It MUST be keyed by
 # tenant_id first, then property_id — otherwise Sunset and Ocean would see identical
@@ -35,34 +37,135 @@ def _mock_revenue_row(tenant_id: str, property_id: str) -> Dict[str, Any]:
         "count": row["count"],
     }
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
 
-    start_date = datetime(year, month, 1)
-    if month < 12:
-        end_date = datetime(year, month + 1, 1)
+# March 2024 totals match database/seed.sql (check-in in property local calendar month).
+_DEV_MOCK_MONTHLY: Dict[str, Dict[str, Any]] = {
+    "tenant-a:prop-001:2024-03": {"total": "1000.00", "count": 3},
+    "tenant-a:prop-001:2024-02": {"total": "1250.00", "count": 1},
+    "tenant-a:prop-002:2024-03": {"total": "4975.50", "count": 4},
+    "tenant-a:prop-003:2024-03": {"total": "6100.50", "count": 2},
+    "tenant-b:prop-001:2024-03": {"total": "0.00", "count": 0},
+    "tenant-b:prop-004:2024-03": {"total": "1776.50", "count": 4},
+    "tenant-b:prop-005:2024-03": {"total": "3256.00", "count": 3},
+}
+
+
+def _mock_monthly_row(tenant_id: str, property_id: str, year: int, month: int) -> Dict[str, Any]:
+    key = f"{tenant_id}:{property_id}:{year}-{month:02d}"
+    row = _DEV_MOCK_MONTHLY.get(key, {"total": "0.00", "count": 0})
+    return {
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+        "total": row["total"],
+        "currency": "USD",
+        "count": row["count"],
+        "period_year": year,
+        "period_month": month,
+    }
+
+
+def _calendar_month_bounds_utc(year: int, month: int, tz_name: str) -> Tuple[datetime, datetime]:
+    """First instant of month and first instant of next month, as UTC, in tz_name local clocks."""
+    try:
+        zi = ZoneInfo(tz_name)
+    except Exception:
+        zi = ZoneInfo("UTC")
+    start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=zi)
+    if month == 12:
+        end_local = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=zi)
     else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+        end_local = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=zi)
+    return (
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+    )
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
-        FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
+
+async def calculate_revenue_calendar_month(
+    property_id: str, tenant_id: str, year: int, month: int
+) -> Dict[str, Any]:
     """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+    Sum reservation revenue for check-ins falling in [year-month) in the property's IANA timezone.
+    Aligns board-style "March revenue" with local calendar month at the property.
+    """
+    if month < 1 or month > 12:
+        raise ValueError("month must be 1-12")
+
+    try:
+        from app.core.database_pool import DatabasePool
+
+        db_pool = DatabasePool()
+        await db_pool.initialize()
+
+        if db_pool.session_factory:
+            async with db_pool.get_session() as session:
+                from sqlalchemy import text
+
+                tz_row = await session.execute(
+                    text(
+                        """
+                    SELECT timezone FROM properties
+                    WHERE id = :property_id AND tenant_id = :tenant_id
+                    LIMIT 1
+                    """
+                    ),
+                    {"property_id": property_id, "tenant_id": tenant_id},
+                )
+                tr = tz_row.fetchone()
+                tz_name = (tr[0] if tr else None) or "UTC"
+
+                start_utc, end_utc = _calendar_month_bounds_utc(year, month, tz_name)
+
+                result = await session.execute(
+                    text(
+                        """
+                    SELECT
+                        property_id,
+                        SUM(total_amount) AS total_revenue,
+                        COUNT(*) AS reservation_count
+                    FROM reservations
+                    WHERE property_id = :property_id
+                      AND tenant_id = :tenant_id
+                      AND check_in_date >= :start_utc
+                      AND check_in_date < :end_utc
+                    GROUP BY property_id
+                    """
+                    ),
+                    {
+                        "property_id": property_id,
+                        "tenant_id": tenant_id,
+                        "start_utc": start_utc,
+                        "end_utc": end_utc,
+                    },
+                )
+                row = result.fetchone()
+
+                if row is not None:
+                    total_revenue = Decimal(str(row.total_revenue or 0))
+                    return {
+                        "property_id": property_id,
+                        "tenant_id": tenant_id,
+                        "total": str(total_revenue),
+                        "currency": "USD",
+                        "count": int(row.reservation_count or 0),
+                        "period_year": year,
+                        "period_month": month,
+                        "property_timezone": tz_name,
+                    }
+                return {
+                    "property_id": property_id,
+                    "tenant_id": tenant_id,
+                    "total": "0.00",
+                    "currency": "USD",
+                    "count": 0,
+                    "period_year": year,
+                    "period_month": month,
+                    "property_timezone": tz_name,
+                }
+        raise Exception("Database pool not available")
+    except Exception as e:
+        print(f"Database error (monthly) for {property_id} (tenant: {tenant_id}): {e}")
+        return _mock_monthly_row(tenant_id, property_id, year, month)
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
     """
